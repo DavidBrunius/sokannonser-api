@@ -10,4 +10,3 @@ pytest
 pytest-cov
 elastic-apm[flask]
 flashtext
-Beaker

@@ -1,7 +1,10 @@
 import sys
 import os
 import pytest
+import certifi
 from sokannonser import settings
+from ssl import create_default_context
+from elasticsearch import Elasticsearch
 # from pprint import pprint
 
 from sokannonser.repository.text_to_concept import TextToConcept
@@ -17,10 +20,18 @@ url = protocol + '://' + host + ':' + str(port)
 
 # print('Running unittests calling %s' % url)
 
-text_to_concept = TextToConcept(ontologyhost=url,
-                              ontologyindex='narvalontology',
-                              ontologyuser=user,
-                              ontologypwd=pwd)
+if user and pwd:
+    context = create_default_context(cafile=certifi.where())
+
+    client = Elasticsearch([url],
+                           use_ssl=True, scheme='https',
+                           ssl_context=context,
+                           http_auth=(user, pwd))
+else:
+    client = Elasticsearch([url], ca_certs=certifi.where(), timeout=30)
+
+text_to_concept = TextToConcept(client)
+
 
 # @pytest.mark.skip(reason="Temporarily disabled")
 @pytest.mark.integration
@@ -66,8 +77,6 @@ def test_rewrite_unigram_misspelled_input():
     # pprint(concepts)
     assert 'sjuksköterska' in concepts['occupations']
     assert 'noggrann' in concepts['traits']
-
-
 
 
 # @pytest.mark.skip(reason="Temporarily disabled")

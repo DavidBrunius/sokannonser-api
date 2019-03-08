@@ -1,63 +1,56 @@
 import logging
-from beaker.cache import CacheManager
-from beaker import util
-
-from sokannonser import settings
-from sokannonser.repository.ontology import Ontology
+from flashtext.keyword import KeywordProcessor
+from elasticsearch import ElasticsearchException
+from elasticsearch.helpers import scan
 
 log = logging.getLogger(__name__)
 
 
 class TextToConcept(object):
-    cache_opts = {
-        'cache.expire': 60 * 60 * 24,  # Expire time in seconds
-        'cache.type': 'memory'
-    }
-
     COMPETENCE_KEY = 'KOMPETENS'
     OCCUPATION_KEY = 'YRKE'
     TRAIT_KEY = 'FORMAGA'
     REMOVED_TAG = '<removed>'
 
-    cache = CacheManager(**util.parse_cache_config_options(cache_opts))
+    def __init__(self, esclient, ontologyindex='narvalontology'):
+        self.keyword_processor = KeywordProcessor()
+        self.client = esclient
+        self._init_keyword_processor(ontologyindex)
 
-    def __init__(self, ontologyhost='http://localhost:9200',
-                 ontologyindex='narvalontology', ontologyuser=None, ontologypwd=None):
+    def _init_keyword_processor(self, ontologyindex):
+        [self.keyword_processor.add_non_word_boundary(token)
+         for token in list('åäöÅÄÖ()')]
 
-        self.ontologyhost = ontologyhost
-        self.ontologyindex = ontologyindex
-        self.ontologyuser = ontologyuser
-        self.ontologypwd = ontologypwd
+        concept_to_term = {}
+        if self.client:
+            for term_obj in self._elastic_iterator(ontologyindex):
+                self.keyword_processor.add_keyword(term_obj['term'], term_obj)
+                concept_preferred_label = term_obj['concept'].lower()
+                if concept_preferred_label not in concept_to_term:
+                    concept_to_term[concept_preferred_label] = []
+                concept_to_term[concept_preferred_label].append(term_obj)
 
-        if settings.ES_HOST != 'localhost':
-            # Cache ontology directly unless it's a local call (tests or docker build)
-            self.get_ontology()
+    def _elastic_iterator(self, index, size=1000):
+        elastic_query = {
+            "query": {
+                "match_all": {}
+            }
+        }
 
-    def get_ontology(self):
-        return self._get_cached_ontology(self.ontologyhost,
-                                         self.ontologyindex,
-                                         self.ontologyuser,
-                                         self.ontologypwd)
-
-
-    @cache.cache('_get_cached_ontology')
-    def _get_cached_ontology(self, ontologyhost, ontologyindex, ontologyuser, ontologypwd):
-        log.info('Creating ontology, host: %s, index: %s, user: %s' % (
-            self.ontologyhost, self.ontologyindex, self.ontologyuser))
-        return Ontology(url=ontologyhost,
-                 index=ontologyindex,
-                 user=ontologyuser,
-                 pwd=ontologypwd,
-                 concept_type=None,
-                 include_misspelled=True)
-
+        scan_result = scan(self.client, elastic_query, index=index, size=size)
+        try:
+            for row in scan_result:
+                yield row['_source']
+        except ElasticsearchException as e:
+            log.error("Failed to load ontology (%s)" % str(e))
 
     def text_to_concepts(self, text):
-        ontology_concepts = self.get_ontology().get_concepts(text, concept_type=None,
-                                                             span_info=False)
+        ontology_concepts = self._get_concepts(text, concept_type=None, span_info=False)
         text_lower = text.lower()
 
         tmp_text = text_lower
+
+        print("OC", ontology_concepts)
 
         for concept in ontology_concepts:
             term = concept['term']
@@ -70,18 +63,18 @@ class TextToConcept(object):
         # print(tmp_text)
 
         skills = [c['concept'].lower() for c in ontology_concepts
-                  if self.filter_concepts(c, self.COMPETENCE_KEY, '')]
+                  if self._filter_concepts(c, self.COMPETENCE_KEY, '')]
         occupations = [c['concept'].lower() for c in ontology_concepts
-                       if self.filter_concepts(c, self.OCCUPATION_KEY, '')]
+                       if self._filter_concepts(c, self.OCCUPATION_KEY, '')]
         traits = [c['concept'].lower() for c in ontology_concepts
-                  if self.filter_concepts(c, self.TRAIT_KEY, '')]
+                  if self._filter_concepts(c, self.TRAIT_KEY, '')]
 
         skills_must_not = [c['concept'].lower() for c in ontology_concepts
-                           if self.filter_concepts(c, self.COMPETENCE_KEY, '-')]
+                           if self._filter_concepts(c, self.COMPETENCE_KEY, '-')]
         occupations_must_not = [c['concept'].lower() for c in ontology_concepts
-                                if self.filter_concepts(c, self.OCCUPATION_KEY, '-')]
+                                if self._filter_concepts(c, self.OCCUPATION_KEY, '-')]
         traits_must_not = [c['concept'].lower() for c in ontology_concepts
-                           if self.filter_concepts(c, self.TRAIT_KEY, '-')]
+                           if self._filter_concepts(c, self.TRAIT_KEY, '-')]
 
         result = {'skills': skills,
                   'occupations': occupations,
@@ -92,7 +85,19 @@ class TextToConcept(object):
 
         return result
 
-    def filter_concepts(self, concept, concept_type, operator):
+    def _get_concepts(self, text, concept_type=None, span_info=False):
+        concepts = self.keyword_processor.extract_keywords(text, span_info=span_info)
+        if concept_type is not None:
+            if span_info:
+                concepts = list(filter(lambda concept: concept[0]['type'] == concept_type,
+                                       concepts))
+            else:
+                concepts = list(filter(lambda concept: concept['type'] == concept_type,
+                                       concepts))
+        print('Returning concepts', concepts)
+        return concepts
+
+    def _filter_concepts(self, concept, concept_type, operator):
         if concept['type'] == concept_type and concept['operator'] == operator:
             return True
         else:
